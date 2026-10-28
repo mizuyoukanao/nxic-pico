@@ -31,11 +31,17 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+include(cmake/ncm_windows_compat.cmake)
+nxic_enable_ncm_windows_compat()
+
 add_executable(nxic_pico
     src/main.c
     src/usb_descriptors.c
     src/procon.c
     src/hid_input.c
+    src/gamepad.c
+    src/switch2_host.c
+    src/dhcp_server.c
     src/mapping.c
     src/settings.c
     src/config_mode.c

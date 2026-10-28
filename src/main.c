@@ -1,4 +1,4 @@
-// NXIC-pico: USB keyboard/mouse -> Nintendo Switch Pro Controller converter
+// NXIC-pico: USB gamepad + keyboard/mouse -> Switch Pro Controller converter
 // for the Waveshare RP2350-USB-A.
 //
 //   core0: TinyUSB device stack on the native USB (USB-C) -> Switch dock
@@ -35,6 +35,7 @@ static void core1_main(void) {
 
     for (;;) {
         tuh_task();
+        hid_input_task();
     }
 }
 

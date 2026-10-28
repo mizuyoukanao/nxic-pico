@@ -1,0 +1,46 @@
+# Backport TinyUSB PR #3914 without modifying the shared Pico SDK.
+# https://github.com/hathach/tinyusb/pull/3914
+# Windows usbncm.sys rejects NTB payload divisors below 4 (Code 10).
+# The legacy driver already emits datagrams at 4-byte boundaries.
+function(nxic_prepare_ncm_driver tinyusb_root output_var)
+    set(ncm_input "${tinyusb_root}/src/class/net/ncm_device.c")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ncm_input}")
+    file(READ "${ncm_input}" ncm_source)
+    foreach(direction IN ITEMS In Out)
+        set(field "wNdb${direction}Divisor")
+        string(REGEX MATCHALL "\\.${field}[ \t]*=[ \t]*[0-9]+," matches "${ncm_source}")
+        list(LENGTH matches count)
+        if(NOT count EQUAL 1)
+            message(FATAL_ERROR "Cannot verify TinyUSB ${field}; review the NCM Windows compatibility patch for this SDK")
+        endif()
+        string(REGEX MATCH "=[ \t]*([0-9]+)," value "${matches}")
+        if(CMAKE_MATCH_1 STREQUAL "1")
+            string(REPLACE "${matches}" ".${field} = 4," ncm_source "${ncm_source}")
+        elseif(NOT CMAKE_MATCH_1 STREQUAL "4")
+            message(FATAL_ERROR "Unexpected TinyUSB ${field}=${CMAKE_MATCH_1}; review NTB alignment before building")
+        endif()
+    endforeach()
+    # configure_file preserves the output timestamp if the contents match.
+    set(generated_dir "${CMAKE_CURRENT_BINARY_DIR}/nxic_ncm_compat")
+    file(MAKE_DIRECTORY "${generated_dir}")
+    file(WRITE "${generated_dir}/ncm_device.c.in" "${ncm_source}")
+    configure_file("${generated_dir}/ncm_device.c.in" "${generated_dir}/ncm_device.c" COPYONLY)
+    set(${output_var} "${generated_dir}/ncm_device.c" PARENT_SCOPE)
+endfunction()
+
+function(nxic_enable_ncm_windows_compat)
+    nxic_prepare_ncm_driver("${PICO_TINYUSB_PATH}" ncm_source)
+    get_target_property(device_sources tinyusb_device_base INTERFACE_SOURCES)
+    set(original "${PICO_TINYUSB_PATH}/src/class/net/ncm_device.c")
+    list(FIND device_sources "${original}" source_index)
+    if(source_index EQUAL -1)
+        message(FATAL_ERROR "TinyUSB NCM source not found in tinyusb_device_base; refusing to omit the Windows fix")
+    endif()
+    list(REMOVE_ITEM device_sources "${original}")
+    list(APPEND device_sources "${ncm_source}")
+    set_property(TARGET tinyusb_device_base PROPERTY INTERFACE_SOURCES "${device_sources}")
+    # Preserve the original driver's local header lookup after relocating it.
+    set_source_files_properties("${ncm_source}" PROPERTIES
+        INCLUDE_DIRECTORIES "${PICO_TINYUSB_PATH}/src/class/net")
+    message(STATUS "NXIC NCM: Windows-compatible NTB divisors (4), SDK unchanged")
+endfunction()

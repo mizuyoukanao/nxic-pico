@@ -1,4 +1,4 @@
-// USB host side: collect keyboard / mouse reports (runs on core1), expose
+// USB host side: collect gamepad / keyboard / mouse reports (runs on core1), expose
 // merged state to core0.
 //
 // Keyboards are switched to boot protocol and strictly validated.
@@ -15,9 +15,11 @@
 #include <string.h>
 
 #include "pico/sync.h"
+#include "pico/time.h"
 #include "tusb.h"
 
 #include "hid_input.h"
+#include "switch2_host.h"
 
 //--------------------------------------------------------------------
 // Mouse report layout extracted from the HID report descriptor
@@ -42,6 +44,14 @@ typedef struct {
     mouse_layout_t layout;
     hid_keyboard_report_t kb;
     uint8_t mouse_buttons;
+    gamepad_kind_t pad_kind;
+    gamepad_state_t pad;
+    gamepad_cal_t cal[4];
+    uint8_t init_stage, init_attempts, sequence;
+    bool init_wait;
+    uint32_t init_deadline;
+    uint32_t last_input;
+    uint8_t tx[64];
 } slot_t;
 
 static slot_t slots[CFG_TUH_HID];
@@ -231,7 +241,11 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
     bool is_kbd = (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD);
     bool is_mouse = (itf_protocol == HID_ITF_PROTOCOL_MOUSE) ||
                     (parsed && lay.is_mouse);
-    if (!is_kbd && !is_mouse) return;
+    uint16_t vid, pid;
+    tuh_vid_pid_get(dev_addr, &vid, &pid);
+    gamepad_kind_t pad_kind = gamepad_identify(vid, pid);
+    if (pad_kind != PAD_NONE) { is_kbd = false; is_mouse = false; }
+    if (!is_kbd && !is_mouse && pad_kind == PAD_NONE) return;
 
     critical_section_enter_blocking(&lock);
     slot_t *s = find_slot(dev_addr, instance);
@@ -248,7 +262,11 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         s->used = true;
         s->dev_addr = dev_addr;
         s->instance = instance;
-        s->itf_protocol = is_kbd ? HID_ITF_PROTOCOL_KEYBOARD : HID_ITF_PROTOCOL_MOUSE;
+        s->itf_protocol = is_kbd ? HID_ITF_PROTOCOL_KEYBOARD :
+                          (is_mouse ? HID_ITF_PROTOCOL_MOUSE : HID_ITF_PROTOCOL_NONE);
+        s->pad_kind = pad_kind;
+        gamepad_neutral(&s->pad);
+        gamepad_default_cal(s->cal);
         if (is_mouse && lay.valid) {
             s->use_layout = true;
             s->layout = lay;
@@ -257,7 +275,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
     critical_section_exit(&lock);
     if (!s) return;
 
-    if (is_kbd || !s->use_layout) {
+    if (is_kbd || (is_mouse && !s->use_layout)) {
         // Boot protocol for keyboards, and for mice whose descriptor we
         // could not parse
         if (tuh_hid_get_protocol(dev_addr, instance) != HID_PROTOCOL_BOOT) {
@@ -291,7 +309,44 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
                                 uint8_t const *report, uint16_t len) {
     slot_t *s = find_slot(dev_addr, instance);
     if (s && len > 0) {
-        if (s->itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+        if (s->pad_kind != PAD_NONE) {
+            if (s->pad_kind <= PAD_SWITCH_RIGHT) {
+                // 0: status, 1/2/3: handshake/baud/handshake, 4: USB-only,
+                // 5: full reports, 6/7: factory stick calibration.
+                static const uint8_t usb_commands[] = {1, 2, 3, 2};
+                bool ack = false;
+                if (s->init_stage < 4 && len >= 2 && report[0] == 0x81 &&
+                    report[1] == usb_commands[s->init_stage]) {
+                    ack = true;
+                    if (s->init_stage == 0 && len >= 4 && s->pad_kind == PAD_SWITCH_GRIP) {
+                        if (report[3] == 1) s->pad_kind = PAD_SWITCH_LEFT;
+                        if (report[3] == 2) s->pad_kind = PAD_SWITCH_RIGHT;
+                    }
+                } else if (len >= 15 && report[0] == 0x21 && (report[13] & 0x80)) {
+                    if (s->init_stage == 5 && report[14] == 3) ack = true;
+                    if (s->init_stage >= 6 && s->init_stage <= 7 &&
+                        report[14] == 0x10 && len >= 29 && report[19] >= 9) {
+                        uint32_t addr = (uint32_t)report[15] | (uint32_t)report[16] << 8 |
+                            (uint32_t)report[17] << 16 | (uint32_t)report[18] << 24;
+                        if (addr == (s->init_stage == 6 ? 0x603du : 0x6046u)) {
+                            gamepad_set_cal(s->cal, s->init_stage == 7, report + 20);
+                            ack = true;
+                        }
+                    }
+                }
+                if (ack && s->init_wait) {
+                    s->init_stage++; s->init_wait = false; s->init_attempts = 0;
+                    s->init_deadline = to_ms_since_boot(get_absolute_time());
+                }
+            }
+            gamepad_state_t next;
+            if (gamepad_parse(s->pad_kind, report, len, s->cal, &next)) {
+                s->last_input = to_ms_since_boot(get_absolute_time());
+                critical_section_enter_blocking(&lock);
+                s->pad = next;
+                critical_section_exit(&lock);
+            }
+        } else if (s->itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
             if (tuh_hid_get_protocol(dev_addr, instance) == HID_PROTOCOL_BOOT &&
                 valid_boot_kb_report(report, len)) {
                 critical_section_enter_blocking(&lock);
@@ -311,6 +366,78 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
         }
     }
     tuh_hid_receive_report(dev_addr, instance);
+}
+
+void hid_input_task(void) {
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    switch2_host_task(now);
+    for (int i = 0; i < CFG_TUH_HID; ++i) {
+        slot_t *s = &slots[i];
+        if (!s->used) continue;
+        // Retry a rejected receive request (e.g. during SET_PROTOCOL).
+        if (tuh_hid_receive_ready(s->dev_addr, s->instance))
+            tuh_hid_receive_report(s->dev_addr, s->instance);
+        if (!s->pad_kind) continue;
+        if ((uint32_t)(now - s->last_input) > 500) {
+            critical_section_enter_blocking(&lock);
+            gamepad_neutral(&s->pad);
+            critical_section_exit(&lock);
+        }
+        if (s->pad_kind > PAD_SWITCH_RIGHT) continue;
+        if (s->init_stage >= 8) {
+            if ((uint32_t)(now - s->last_input) <= 1500) continue;
+            s->init_stage = 0; s->init_attempts = 0; s->init_wait = false;
+            s->last_input = now;
+        }
+        if ((int32_t)(now - s->init_deadline) < 0) continue;
+        if (s->init_wait) {
+            s->init_wait = false;
+            if (s->init_attempts >= 4) {
+                // Calibration failure must not disable otherwise working input.
+                // Restart the handshake for a grip attached without Joy-Cons.
+                // Some genuine charging grips do not ACK the baud-rate
+                // handshake on the right interface; continue to USB-only.
+                s->init_stage = (s->init_stage >= 6 ||
+                    (s->init_stage >= 1 && s->init_stage <= 3)) ? s->init_stage + 1 : 0;
+                s->init_attempts = 0;
+                s->init_deadline = now + 500;
+                continue;
+            }
+        }
+        if (!tuh_hid_send_ready(s->dev_addr, s->instance)) continue;
+        memset(s->tx, 0, sizeof(s->tx));
+        uint8_t rid;
+        uint16_t n;
+        if (s->init_stage <= 4) {
+            static const uint8_t cmd[] = {1, 2, 3, 2, 4};
+            rid = 0x80; s->tx[0] = cmd[s->init_stage]; n = 63;
+        } else {
+            rid = 1; n = 63;
+            s->tx[0] = s->sequence++ & 15;
+            static const uint8_t rumble_off[8] = {0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40};
+            memcpy(s->tx + 1, rumble_off, 8);
+            if (s->init_stage == 5) { s->tx[9] = 3; s->tx[10] = 0x30; }
+            else {
+                uint16_t addr = s->init_stage == 6 ? 0x603d : 0x6046;
+                s->tx[9] = 0x10; s->tx[10] = addr & 255; s->tx[11] = addr >> 8;
+                s->tx[14] = 9;
+            }
+        }
+        if (tuh_hid_send_report(s->dev_addr, s->instance, rid, s->tx, n)) {
+            s->init_deadline = now + 250;
+            if (s->init_stage == 4) {
+                s->init_stage++; s->init_deadline = now + 20;
+            } else { s->init_wait = true; s->init_attempts++; }
+        }
+    }
+}
+
+void hid_gamepad_state(gamepad_state_t *state) {
+    gamepad_neutral(state);
+    critical_section_enter_blocking(&lock);
+    for (int i = 0; i < CFG_TUH_HID; ++i)
+        if (slots[i].used && slots[i].pad_kind) gamepad_merge(state, &slots[i].pad);
+    critical_section_exit(&lock);
 }
 
 //--------------------------------------------------------------------

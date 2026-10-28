@@ -21,10 +21,6 @@
 #include "mapping.h"
 #include "settings.h"
 
-#define STICK_MIN    0x000
-#define STICK_CENTER 0x800
-#define STICK_MAX    0xFFF
-
 // Pro Controller standard input report button bits
 #define BTN0_Y        0x01
 #define BTN0_X        0x02
@@ -46,12 +42,6 @@
 #define BTN2_LEFT     0x08
 #define BTN2_L        0x40
 #define BTN2_ZL       0x80
-
-static uint16_t axis12(bool neg, bool pos) {
-    if (pos && !neg) return STICK_MAX;
-    if (neg && !pos) return STICK_MIN;
-    return STICK_CENTER;
-}
 
 static void pack_stick(uint8_t *d, uint16_t x, uint16_t y) {
     d[0] = (uint8_t)(x & 0xFF);
@@ -212,14 +202,20 @@ void mapping_get_state(controller_state_t *st) {
     if (hid_key_down(cfg->key_btn_l))      b2 |= BTN2_L;
     if (hid_key_down(cfg->key_btn_zl))     b2 |= BTN2_ZL;
 
+    gamepad_state_t pad;
+    hid_gamepad_state(&pad);
+    b0 |= pad.buttons[0];
+    b1 |= pad.buttons[1];
+    b2 |= pad.buttons[2];
+
     st->btn[0] = b0;
     st->btn[1] = b1;
     st->btn[2] = b2;
 
-    uint16_t lx = axis12(hid_key_down(cfg->key_ls_left), hid_key_down(cfg->key_ls_right));
-    uint16_t ly = axis12(hid_key_down(cfg->key_ls_down), hid_key_down(cfg->key_ls_up));
-    uint16_t rx = axis12(hid_key_down(cfg->key_rs_left), hid_key_down(cfg->key_rs_right));
-    uint16_t ry = axis12(hid_key_down(cfg->key_rs_down), hid_key_down(cfg->key_rs_up));
+    uint16_t lx = gamepad_axis_keys(pad.axis[0], hid_key_down(cfg->key_ls_left), hid_key_down(cfg->key_ls_right));
+    uint16_t ly = gamepad_axis_keys(pad.axis[1], hid_key_down(cfg->key_ls_down), hid_key_down(cfg->key_ls_up));
+    uint16_t rx = gamepad_axis_keys(pad.axis[2], hid_key_down(cfg->key_rs_left), hid_key_down(cfg->key_rs_right));
+    uint16_t ry = gamepad_axis_keys(pad.axis[3], hid_key_down(cfg->key_rs_down), hid_key_down(cfg->key_rs_up));
     pack_stick(&st->stick[0], lx, ly);
     pack_stick(&st->stick[3], rx, ry);
 

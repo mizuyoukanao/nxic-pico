@@ -24,6 +24,7 @@
 #include "lwip/udp.h"
 
 #include "config_mode.h"
+#include "dhcp_server.h"
 #include "settings.h"
 
 //--------------------------------------------------------------------
@@ -33,7 +34,6 @@
 
 static const ip4_addr_t our_ip = {CFG_IP4(192, 168, 7, 1)};
 static const ip4_addr_t our_mask = {CFG_IP4(255, 255, 255, 0)};
-static const ip4_addr_t client_ip = {CFG_IP4(192, 168, 7, 16)};
 
 // MAC presented to the host (filled from the board id at startup)
 uint8_t tud_network_mac_address[6] = {0x02, 0x4E, 0x58, 0x00, 0x00, 0x01};
@@ -72,7 +72,7 @@ static err_t linkoutput_fn(struct netif *netif, struct pbuf *p) {
             tud_network_xmit(p, 0);
             return ERR_OK;
         }
-        if (time_reached(deadline)) return ERR_OK; // drop rather than stall
+        if (time_reached(deadline)) return ERR_MEM;
         tud_task();
     }
 }
@@ -99,7 +99,10 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
     if (size) {
         struct pbuf *p = pbuf_alloc(PBUF_RAW, size, PBUF_POOL);
         if (!p) return false;
-        memcpy(p->payload, src, size);
+        if (pbuf_take(p, src, size) != ERR_OK) {
+            pbuf_free(p);
+            return false;
+        }
         received_frame = p;
     }
     return true;
@@ -121,10 +124,13 @@ void tud_network_init_cb(void) {
 static void service_traffic(void) {
     if (received_frame) {
         diag_reach(1);
-        ethernet_input(received_frame, &netif_data);
+        struct pbuf *p = received_frame;
         received_frame = NULL;
-        tud_network_recv_renew();
+        ethernet_input(p, &netif_data);
     }
+    // Also retry after allocation failure; no new USB completion may arrive
+    // while TinyUSB is holding a rejected datagram.
+    tud_network_recv_renew();
 }
 
 //--------------------------------------------------------------------
@@ -136,68 +142,35 @@ static void dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                       const ip_addr_t *src_addr, u16_t src_port) {
     (void)arg;
     (void)src_addr;
-    (void)src_port;
-
-    uint8_t req[320];
-    uint16_t len = (uint16_t)pbuf_copy_partial(p, req, sizeof(req), 0);
+    if (!p) return;
+    if (src_port != 68 || p->tot_len > 1472) { pbuf_free(p); return; }
+    // NO_SYS: one callback at a time. Keep full-MTU requests off Pico's
+    // small core0 stack.
+    static uint8_t req[1472], reply[300];
+    uint16_t len = pbuf_copy_partial(p, req, sizeof(req), 0);
     pbuf_free(p);
-    if (len < 244 || req[0] != 1) return; // BOOTREQUEST only
-
-    // Find DHCP message type (option 53)
-    uint8_t msg_type = 0;
-    for (uint16_t i = 240; i + 2 < len && req[i] != 255;) {
-        uint8_t opt = req[i], olen = req[i + 1];
-        if (opt == 53 && olen >= 1) msg_type = req[i + 2];
-        if (opt == 0) i++;
-        else i = (uint16_t)(i + 2 + olen);
-    }
-    if (msg_type != 1 && msg_type != 3) return; // DISCOVER / REQUEST only
-
-    uint8_t reply[320];
-    memset(reply, 0, sizeof(reply));
-    reply[0] = 2;                       // BOOTREPLY
-    reply[1] = 1;                       // ethernet
-    reply[2] = 6;                       // hwaddr len
-    memcpy(&reply[4], &req[4], 4);      // xid
-    memcpy(&reply[10], &req[10], 2);    // flags
-    memcpy(&reply[16], &client_ip, 4);  // yiaddr
-    memcpy(&reply[20], &our_ip, 4);     // siaddr
-    memcpy(&reply[28], &req[28], 16);   // chaddr
-    reply[236] = 99; reply[237] = 130; reply[238] = 83; reply[239] = 99; // cookie
-
-    uint16_t i = 240;
-    reply[i++] = 53; reply[i++] = 1;    // message type
-    reply[i++] = (msg_type == 1) ? 2 : 5; // OFFER / ACK
-    reply[i++] = 54; reply[i++] = 4;    // server id
-    memcpy(&reply[i], &our_ip, 4); i += 4;
-    reply[i++] = 51; reply[i++] = 4;    // lease time: 1 day
-    reply[i++] = 0; reply[i++] = 1; reply[i++] = 0x51; reply[i++] = 0x80;
-    reply[i++] = 1; reply[i++] = 4;     // subnet mask
-    memcpy(&reply[i], &our_mask, 4); i += 4;
-    reply[i++] = 3; reply[i++] = 4;     // router
-    memcpy(&reply[i], &our_ip, 4); i += 4;
-    reply[i++] = 6; reply[i++] = 4;     // DNS server
-    memcpy(&reply[i], &our_ip, 4); i += 4;
-    reply[i++] = 255;
-    // BOOTP messages must be at least 300 bytes; some clients drop shorter
-    // packets (zero padding after the END option is legal)
-    if (i < 300) i = 300;
-
-    struct pbuf *out = pbuf_alloc(PBUF_TRANSPORT, i, PBUF_RAM);
+    size_t out_len = dhcp_server_reply(req, len, reply, sizeof(reply));
+    if (!out_len) return;
+    struct pbuf *out = pbuf_alloc(PBUF_TRANSPORT, out_len, PBUF_RAM);
     if (!out) return;
-    memcpy(out->payload, reply, i);
-    // Send on our netif explicitly -- routing a limited broadcast through
-    // the default-netif lookup is what simple DHCP servers get wrong
-    udp_sendto_if(pcb, out, IP_ADDR_BROADCAST, 68, &netif_data);
+    pbuf_take(out, reply, out_len);
+    err_t err = udp_sendto_if(pcb, out, IP_ADDR_BROADCAST, 68, &netif_data);
     pbuf_free(out);
-    if (msg_type == 3) diag_reach(2); // ACK sent
+    if (err == ERR_OK && reply[242] == 5) diag_reach(2);
 }
 
-static void dhcpd_init(void) {
+static bool dhcpd_init(void) {
     dhcp_pcb = udp_new();
-    udp_bind(dhcp_pcb, IP_ANY_TYPE, 67);
+    if (!dhcp_pcb) return false;
+    ip_set_option(dhcp_pcb, SOF_BROADCAST);
+    if (udp_bind(dhcp_pcb, IP_ANY_TYPE, 67) != ERR_OK) {
+        udp_remove(dhcp_pcb);
+        dhcp_pcb = NULL;
+        return false;
+    }
     udp_bind_netif(dhcp_pcb, &netif_data);
     udp_recv(dhcp_pcb, dhcp_recv, NULL);
+    return true;
 }
 
 //--------------------------------------------------------------------
@@ -556,7 +529,10 @@ void config_mode_main(void) {
     netif_set_default(&netif_data);
     netif_set_up(&netif_data);
 
-    dhcpd_init();
+    if (!dhcpd_init()) {
+        led_set_rgb(40, 0, 0);
+        for (;;) tight_loop_contents();
+    }
     http_init();
 
     usb_config_mode = true;

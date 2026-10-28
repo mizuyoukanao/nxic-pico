@@ -10,7 +10,7 @@ typedef struct {
     int16_t imu[3][6]; // 3 frames x {ax, ay, az, gx, gy, gz}
 } controller_state_t;
 
-// Build the current state from keyboard / mouse input.
+// Build the current state from gamepad + keyboard / mouse input.
 // Must be called exactly once per input report (consumes mouse deltas).
 void mapping_get_state(controller_state_t *st);
 

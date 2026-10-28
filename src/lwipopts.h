@@ -26,6 +26,10 @@
 #define LWIP_UDP                    1
 #define LWIP_TCP                    1
 #define LWIP_DHCP                   0
+// Accept BOOTREQUESTs from 0.0.0.0. Without this, ip4_input treats the
+// unspecified source as an invalid broadcast source before UDP sees it.
+// lwIP passes the destination port in network byte order.
+#define LWIP_IP_ACCEPT_UDP_PORT(port) ((port) == PP_HTONS(67))
 #define LWIP_DNS                    0
 
 #define TCP_MSS                     1460

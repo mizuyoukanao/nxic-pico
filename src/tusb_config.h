@@ -54,7 +54,7 @@ extern "C" {
 #define CFG_TUD_NCM               1
 
 //--------------------------------------------------------------------
-// Host (keyboard / mouse, behind a hub)
+// Host (gamepads / keyboard / mouse, behind a hub)
 //--------------------------------------------------------------------
 // Large enough for the long report descriptors of gaming mice
 #define CFG_TUH_ENUMERATION_BUFSIZE 1024
